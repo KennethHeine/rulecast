@@ -1,4 +1,4 @@
-import { rm, writeFile } from "node:fs/promises"
+import { copyFile, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 
@@ -84,6 +84,49 @@ describe("rulecast run: file selection", () => {
     expect(JSON.parse(result.stdout).preexistingSummary).toEqual([
       { rule: "backend/no-httpexception", file: USERS, count: 1 },
     ])
+  })
+
+  test("a process that outlives its hook checks the current staging area", async () => {
+    const root = await createFixture()
+    const expired = path.join(root, ".git", "next-index-123.lock")
+    await copyFile(path.join(root, ".git", "index"), expired)
+    await rm(expired)
+    await writeFile(path.join(root, USERS), VIOLATION)
+    await git(root, "add", USERS)
+
+    vi.stubEnv("GIT_INDEX_FILE", expired)
+    try {
+      const result = await run(root, "--format", "json")
+      expect(result.code).toBe(1)
+      expect(lines(result.stdout)).toEqual([3])
+
+      // An inherited path from another checkout may no longer even have a usable parent directory.
+      vi.stubEnv("GIT_INDEX_FILE", path.join(root, USERS, "foreign-index"))
+      const unrelated = await run(root, "--format", "json")
+      expect(unrelated.code).toBe(1)
+      expect(lines(unrelated.stdout)).toEqual([3])
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  test("--all-files sees a force-added ignored file even inside a path-limited commit hook", async () => {
+    const root = await createFixture()
+    const candidate = path.join(root, ".git", "next-index-123.lock")
+    await copyFile(path.join(root, ".git", "index"), candidate)
+    const other = "app/services/orders.py"
+    await writeFile(path.join(root, ".gitignore"), other)
+    await writeFile(path.join(root, other), VIOLATION)
+    await git(root, "add", "-f", other)
+
+    vi.stubEnv("GIT_INDEX_FILE", candidate)
+    try {
+      const result = await run(root, "--all-files", "--format", "json")
+      expect(result.code).toBe(1)
+      expect(JSON.parse(result.stdout).findings).toContainEqual(expect.objectContaining({ file: other }))
+    } finally {
+      vi.unstubAllEnvs()
+    }
   })
 
   test("--files resolves paths relative to the current directory", async () => {

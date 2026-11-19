@@ -1,5 +1,6 @@
+import { AsyncLocalStorage } from "node:async_hooks"
 import { execFile } from "node:child_process"
-import { readFileSync, realpathSync, statSync } from "node:fs"
+import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs"
 import path from "node:path"
 import { promisify } from "node:util"
 import { childEnv } from "./child-env"
@@ -36,6 +37,51 @@ export function withoutInheritedGitEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEn
   return scrubbed
 }
 
+interface HookIndex {
+  file: string
+  top: string
+  dev: bigint
+  ino: bigint
+  ctimeNs: bigint
+}
+
+const hookIndex = new AsyncLocalStorage<HookIndex | undefined>()
+
+/** Select the hook's index once. A process that starts after the commit uses the normal index. */
+function inheritedIndex(cwd: string): HookIndex | undefined {
+  const index = process.env.GIT_INDEX_FILE
+  if (!index || path.basename(index) === "index") return undefined
+  const absolute = path.resolve(index)
+  const checkout = checkoutOf(cwd)
+  if (checkout === null) return undefined
+  let gitDir: string
+  try {
+    gitDir = realpathSync(path.dirname(absolute))
+    if (gitDir !== realpathSync(checkout.gitDir)) return undefined
+  } catch {
+    // An inherited path we cannot tie to this checkout stays scrubbed.
+    return undefined
+  }
+  const file = path.join(gitDir, path.basename(absolute))
+  const stat = lstatSync(file, { bigint: true, throwIfNoEntry: false })
+  if (!stat?.isFile()) return undefined
+  return { file, top: checkout.top, dev: stat.dev, ino: stat.ino, ctimeNs: stat.ctimeNs }
+}
+
+/** Keep one index for file selection and content reads, and validate it before reporting results. */
+export async function withHookIndex<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
+  const index = inheritedIndex(cwd)
+  const result = await hookIndex.run(index, operation)
+  if (index) {
+    // Git treats an expired temporary index as empty. Discard the check if Git replaced or removed it.
+    const current = lstatSync(index.file, { bigint: true, throwIfNoEntry: false })
+    if (current?.dev !== index.dev || current.ino !== index.ino || current.ctimeNs !== index.ctimeNs) {
+      throw new Error("the Git hook index changed during the check. Rerun rulecast against the current staging area")
+    }
+  }
+  return result
+}
+
 function environment(extra?: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
   // No optional locks: `git status` would otherwise refresh the index under .git/index.lock, and an
   // agent's own `git commit` running at that moment fails with "index.lock exists".
@@ -53,7 +99,10 @@ export async function git(
   env?: Readonly<Record<string, string>>,
   options: { timeoutMs?: number } = {},
 ): Promise<GitResult> {
-  const running = exec("git", args, { cwd, maxBuffer: 64 * 1024 * 1024, env: environment(env) })
+  const gitEnv = environment(env)
+  const index = hookIndex.getStore()
+  if (index && checkoutOf(cwd)?.top === index.top) gitEnv.GIT_INDEX_FILE = index.file
+  const running = exec("git", args, { cwd, maxBuffer: 64 * 1024 * 1024, env: gitEnv })
   const finished = running.then(
     ({ stdout }): GitResult => ({ ok: true, stdout }),
     (error: unknown): GitResult => {
@@ -207,10 +256,10 @@ export async function insideWorkTree(dir: string): Promise<boolean> {
 
 /**
  * The checkout `dir` is in, from the files git leaves and without running it (a hook pays for every
- * process): the checkout's top directory, and the repository's common git directory, which every
- * worktree of one repository shares. Real paths. Null outside a repository.
+ * process): the checkout's top and its own git directory, and the common git directory shared
+ * by every worktree of the repository. The main checkout keeps its historic <top>/.git cache key.
  */
-export function checkoutOf(dir: string): { top: string; commonDir: string } | null {
+export function checkoutOf(dir: string): { top: string; gitDir: string; commonDir: string } | null {
   let top: string
   try {
     top = realpathSync(dir)
@@ -220,7 +269,7 @@ export function checkoutOf(dir: string): { top: string; commonDir: string } | nu
   for (;;) {
     const dotGit = path.join(top, ".git")
     const stat = statSync(dotGit, { throwIfNoEntry: false })
-    if (stat?.isDirectory()) return { top, commonDir: dotGit }
+    if (stat?.isDirectory()) return { top, gitDir: dotGit, commonDir: dotGit }
     if (stat?.isFile()) {
       try {
         // A worktree's `.git` names its own git directory, whose `commondir` names the shared one.
@@ -232,7 +281,7 @@ export function checkoutOf(dir: string): { top: string; commonDir: string } | nu
         const common = statSync(commondir, { throwIfNoEntry: false })
           ? path.resolve(gitDir, readFileSync(commondir, "utf8").trim())
           : gitDir
-        return { top, commonDir: realpathSync(common) }
+        return { top, gitDir, commonDir: realpathSync(common) }
       } catch {
         return null
       }

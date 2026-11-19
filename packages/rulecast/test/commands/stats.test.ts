@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { mkdir, mkdtemp, realpath, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, realpath, rename, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { describe, expect, test } from "vitest"
@@ -574,6 +574,15 @@ describe("rulecast stats --worktrees (#71)", () => {
     expect(
       document.checkouts.map((checkout: { name: string; exists: boolean }) => [checkout.name, checkout.exists]),
     ).toEqual([["w4", false]])
+
+    // An existing cache records <root>/.git. Moving the metadata behind a symlink must keep it readable.
+    const dotGit = path.join(root, ".git")
+    const metadata = path.join(parent, "metadata")
+    await rename(dotGit, metadata)
+    await symlink(metadata, dotGit, "dir")
+    const moved = await runCli(root, ["stats", "--worktrees", "w4", "--format", "json"])
+    expect(moved.code).toBe(0)
+    expect(JSON.parse(moved.stdout).checkouts).toEqual(document.checkouts)
   })
 
   test("one session in several checkouts is one session in the weekly counts too", async () => {

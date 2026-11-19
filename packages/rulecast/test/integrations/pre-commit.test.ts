@@ -145,6 +145,24 @@ describe.skipIf(!hasPreCommit())("the shipped pre-commit hooks", () => {
     expect(stagedOnly.code).not.toBe(0)
   })
 
+  test("a path-limited commit checks the named file and leaves unrelated staged files alone", {
+    timeout: 120_000,
+  }, async () => {
+    const { root } = await project()
+    await write(root, SERVICE, "def get():\n    raise HTTPException(503)\n")
+    const rejected = await hooked(root, "commit", "-qm", "change service", "--", SERVICE)
+    expect(rejected.code).toBe(1)
+    expect(rejected.output).toContain(`${SERVICE}:2 raises HTTPException`)
+
+    const other = "app/services/orders.py"
+    await write(root, other, "def order():\n    raise HTTPException(409)\n")
+    await git(root, "add", other)
+    await write(root, SERVICE, "def get():\n    return 1\n")
+    const accepted = await hooked(root, "commit", "-qm", "fix service", "--", SERVICE)
+    expect(accepted.code).toBe(0)
+    expect(await git(root, "diff", "--cached", "--name-only")).toBe(other)
+  })
+
   test("a branch's first push judges only the branch's commits", { timeout: 120_000 }, async () => {
     const { root } = await project()
     await git(root, "checkout", "-q", "-b", "feature")
