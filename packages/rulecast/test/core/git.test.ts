@@ -1,4 +1,4 @@
-import { mkdir, rm, writeFile } from "node:fs/promises"
+import { copyFile, mkdir, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { describe, expect, test } from "vitest"
 
@@ -7,6 +7,7 @@ import {
   changedFilesBetween,
   changedFilesSince,
   fileAtCommit,
+  fileInIndex,
   headCommit,
   mergeBase,
   git as runGit,
@@ -90,6 +91,30 @@ describe("git helpers", () => {
     await git(root, "rm", "-q", "b.ts")
     await writeFile(path.join(root, "unstaged.ts"), "u\n")
     expect(await stagedFiles(root)).toEqual(["a.ts", "c.ts"])
+  })
+
+  test("an alternate index belongs only to its worktree, including reads from a subdirectory", async () => {
+    const main = await createRepo({ "src/a.ts": "original\n" })
+    const linked = await createProject({})
+    await git(main, "worktree", "add", "-q", "--detach", linked, "HEAD")
+    const gitDir = await git(linked, "rev-parse", "--absolute-git-dir")
+    const alternate = path.join(gitDir, "candidate-index")
+    await writeFile(path.join(linked, "src/a.ts"), "candidate\n")
+    await git(linked, "add", "src/a.ts")
+    await copyFile(path.join(gitDir, "index"), alternate)
+    await git(linked, "restore", "--staged", "--", "src/a.ts")
+    await writeFile(path.join(linked, "src/a.ts"), "working copy\n")
+
+    const saved = { ...process.env }
+    process.env.GIT_INDEX_FILE = path.relative(process.cwd(), alternate)
+    try {
+      const subdir = path.join(linked, "src")
+      expect(await stagedFiles(subdir)).toEqual(["a.ts"])
+      expect(await fileInIndex(subdir, "a.ts")).toBe("candidate\n")
+      expect(await stagedFiles(main)).toEqual([])
+    } finally {
+      process.env = saved
+    }
   })
 
   test("changedFilesBetween lists files changed between two commits, and mergeBase takes a second ref", async () => {

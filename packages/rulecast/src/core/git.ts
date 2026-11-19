@@ -36,10 +36,29 @@ export function withoutInheritedGitEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEn
   return scrubbed
 }
 
-function environment(extra?: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
+/** Git puts a path-limited commit's index in the worktree's own git directory. */
+function hookIndexFor(cwd: string, index: string): string | undefined {
+  // A hook can pass a relative path. Resolve it before running git from a package below the root.
+  const absolute = path.resolve(index)
+  try {
+    const dir = realpathSync(path.dirname(absolute))
+    if (dir === checkoutOf(cwd)?.gitDir) return path.join(dir, path.basename(absolute))
+  } catch {
+    // An index whose owning worktree cannot be established stays scrubbed.
+  }
+  return undefined
+}
+
+function environment(cwd: string, extra?: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
   // No optional locks: `git status` would otherwise refresh the index under .git/index.lock, and an
   // agent's own `git commit` running at that moment fails with "index.lock exists".
-  return withoutInheritedGitEnv({ ...childEnv(), GIT_OPTIONAL_LOCKS: "0", ...extra })
+  const inherited: NodeJS.ProcessEnv = { ...childEnv(), GIT_OPTIONAL_LOCKS: "0", ...extra }
+  const env = withoutInheritedGitEnv(inherited)
+  if (inherited.GIT_INDEX_FILE) {
+    const index = hookIndexFor(cwd, inherited.GIT_INDEX_FILE)
+    if (index !== undefined) env.GIT_INDEX_FILE = index
+  }
+  return env
 }
 
 /**
@@ -53,7 +72,7 @@ export async function git(
   env?: Readonly<Record<string, string>>,
   options: { timeoutMs?: number } = {},
 ): Promise<GitResult> {
-  const running = exec("git", args, { cwd, maxBuffer: 64 * 1024 * 1024, env: environment(env) })
+  const running = exec("git", args, { cwd, maxBuffer: 64 * 1024 * 1024, env: environment(cwd, env) })
   const finished = running.then(
     ({ stdout }): GitResult => ({ ok: true, stdout }),
     (error: unknown): GitResult => {
@@ -207,10 +226,10 @@ export async function insideWorkTree(dir: string): Promise<boolean> {
 
 /**
  * The checkout `dir` is in, from the files git leaves and without running it (a hook pays for every
- * process): the checkout's top directory, and the repository's common git directory, which every
- * worktree of one repository shares. Real paths. Null outside a repository.
+ * process): the checkout's top and its own git directory, and the common git directory shared
+ * by every worktree of the repository. Real paths. Null outside a repository.
  */
-export function checkoutOf(dir: string): { top: string; commonDir: string } | null {
+export function checkoutOf(dir: string): { top: string; gitDir: string; commonDir: string } | null {
   let top: string
   try {
     top = realpathSync(dir)
@@ -220,19 +239,22 @@ export function checkoutOf(dir: string): { top: string; commonDir: string } | nu
   for (;;) {
     const dotGit = path.join(top, ".git")
     const stat = statSync(dotGit, { throwIfNoEntry: false })
-    if (stat?.isDirectory()) return { top, commonDir: dotGit }
+    if (stat?.isDirectory()) {
+      const gitDir = realpathSync(dotGit)
+      return { top, gitDir, commonDir: gitDir }
+    }
     if (stat?.isFile()) {
       try {
         // A worktree's `.git` names its own git directory, whose `commondir` names the shared one.
         const pointer = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, "utf8"))
         if (pointer === null) return null
-        const gitDir = path.resolve(top, pointer[1]!.trim())
+        const gitDir = realpathSync(path.resolve(top, pointer[1]!.trim()))
         // A submodule's has none: its git directory is its own.
         const commondir = path.join(gitDir, "commondir")
         const common = statSync(commondir, { throwIfNoEntry: false })
           ? path.resolve(gitDir, readFileSync(commondir, "utf8").trim())
           : gitDir
-        return { top, commonDir: realpathSync(common) }
+        return { top, gitDir, commonDir: realpathSync(common) }
       } catch {
         return null
       }
