@@ -36,6 +36,7 @@ import {
   insideWorkTree,
   mergeBase,
   stagedFiles,
+  withHookIndex,
 } from "../core/git"
 import { cacheHome, ensureProjectState } from "../core/home"
 import { type PipelineResult, runPipeline } from "../core/pipeline"
@@ -158,6 +159,12 @@ export interface SelectedFiles {
   baseCommit: string | null
   /** Where current content is read from (core/content.ts). */
   content: ContentSource
+}
+
+/** Only a staged check reads the hook's index. Worktree and ref selections use the normal Git environment. */
+function withSelectedIndex<T>(cwd: string, run: RunArgs, check: () => Promise<T>): Promise<T> {
+  const staged = run.files === null && run.fromRef === null && !run.allFiles && run.session === null
+  return staged ? withHookIndex(cwd, check) : check()
 }
 
 /** Spec §12, `run` file selection. */
@@ -486,7 +493,7 @@ export function exitCodeForChecks(checks: readonly ProjectCheck[]): number {
 
 /** A verify event over the selected files, printed in the chosen format. Shared by run and try-repo. */
 export async function executeRun(input: RunInput): Promise<number> {
-  const check = await checkRun(input)
+  const check = await withSelectedIndex(input.io.cwd, input.run, () => checkRun(input))
   const text = await formatRun(input.run, [{ project: input.project, check }], input.displayFrom)
   if (text) input.io.stdout(`${text}\n`)
   return exitCodeFor(check.result.delivery, check.complete)
@@ -561,30 +568,33 @@ export async function runCommand(root: string, args: string[], registry: Detecto
   }
   if (run.leading.length > 1) throw new UsageError(`unexpected arguments: ${run.leading.slice(1).join(" ")}`)
   const ruleId = run.leading[0] ?? null
-  const { projects, displayFrom } = await compileRun(
-    await routeRun(root, io.cwd, run, cacheHome(io.env)),
-    ruleId,
-    run,
-    registry,
-    io,
-  )
-  const checks = await Promise.all(
-    projects.map(async ({ project, selected }) => ({
-      project,
-      check: await checkRun(
-        {
-          project,
-          ruleId,
-          run,
-          registry,
-          io,
-          committedBaseline: true,
-          ...(displayFrom === undefined ? {} : { displayFrom }),
-        },
-        selected,
-      ),
-    })),
-  )
+  const { checks, displayFrom } = await withSelectedIndex(io.cwd, run, async () => {
+    const { projects, displayFrom } = await compileRun(
+      await routeRun(root, io.cwd, run, cacheHome(io.env)),
+      ruleId,
+      run,
+      registry,
+      io,
+    )
+    const checks = await Promise.all(
+      projects.map(async ({ project, selected }) => ({
+        project,
+        check: await checkRun(
+          {
+            project,
+            ruleId,
+            run,
+            registry,
+            io,
+            committedBaseline: true,
+            ...(displayFrom === undefined ? {} : { displayFrom }),
+          },
+          selected,
+        ),
+      })),
+    )
+    return { checks, displayFrom }
+  })
   const text = await formatRun(run, checks, displayFrom)
   const code = exitCodeForChecks(checks)
   const deliveries = checks.map(({ check }) => check.result.delivery)

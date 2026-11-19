@@ -12,6 +12,7 @@ import {
   mergeBase,
   git as runGit,
   stagedFiles,
+  withHookIndex,
 } from "../../src/core/git"
 import { createRepo, git } from "../helpers/git"
 import { createProject } from "../helpers/project"
@@ -109,9 +110,40 @@ describe("git helpers", () => {
     process.env.GIT_INDEX_FILE = path.relative(process.cwd(), alternate)
     try {
       const subdir = path.join(linked, "src")
-      expect(await stagedFiles(subdir)).toEqual(["a.ts"])
-      expect(await fileInIndex(subdir, "a.ts")).toBe("candidate\n")
-      expect(await stagedFiles(main)).toEqual([])
+      await expect(
+        withHookIndex(linked, async () => {
+          expect(await stagedFiles(subdir)).toEqual(["a.ts"])
+          expect(await fileInIndex(subdir, "a.ts")).toBe("candidate\n")
+          expect(await stagedFiles(main)).toEqual([])
+          await rm(alternate)
+          return fileInIndex(subdir, "a.ts")
+        }),
+      ).rejects.toThrow("Git hook index changed")
+      expect(await withHookIndex(linked, () => fileInIndex(subdir, "a.ts"))).toBe("original\n")
+    } finally {
+      process.env = saved
+    }
+  })
+
+  test("rewriting a live hook index invalidates a check even when the inode stays the same", async () => {
+    const root = await createRepo({ "a.ts": "original\n" })
+    const index = path.join(root, ".git", "index")
+    const alternate = path.join(root, ".git", "next-index-123.lock")
+    await writeFile(path.join(root, "a.ts"), "candidate\n")
+    await git(root, "add", "a.ts")
+    await copyFile(index, alternate)
+    await git(root, "restore", "--staged", "--", "a.ts")
+    const saved = { ...process.env }
+    process.env.GIT_INDEX_FILE = alternate
+    try {
+      await expect(
+        withHookIndex(root, async () => {
+          expect(await stagedFiles(root)).toEqual(["a.ts"])
+          // copyFile overwrites the existing file in place.
+          await copyFile(index, alternate)
+          return stagedFiles(root)
+        }),
+      ).rejects.toThrow("Git hook index changed")
     } finally {
       process.env = saved
     }
